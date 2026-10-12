@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+"""Query and triage bugs in the sashiko.dev bug database.
+
+To get a token:
+
+  1. Log in on https://sashiko.dev with the email magic link.
+  2. Open the browser console (F12) on any sashiko.dev page and run:
+
+       fetch('/api/auth/token', {method: 'POST',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({max_bug_access: 'manage', expires_in_days: 30})})
+         .then(r => r.json()).then(j => console.log(j.token))
+
+     The page adds your session's bearer header to the request.
+     max_bug_access caps what the token may do: 'read' allows list and show,
+     'comment' adds comments, 'manage' adds close, dismiss, dup and assign.
+     The cap never grants more than your account has through MAINTAINERS.
+     The server clamps expires_in_days to 1..90.
+
+  3. Save it with 'sashiko-bugs token-save', which reads the token from
+     stdin, or export SASHIKO_API_TOKEN.
+
+  The browser session JWT itself is in localStorage under
+  'sashiko_session_token'. It works too but has your full rights, so a
+  minted token is the safer choice.
+
+Token lookup order: --token, $SASHIKO_API_TOKEN, ~/.config/sashiko/token.
+Server: --server, $SASHIKO_SERVER, https://sashiko.dev.
+"""
+
+import argparse
+import base64
+import datetime
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_SERVER = "https://sashiko.dev"
+TOKEN_FILE = os.path.expanduser("~/.config/sashiko/token")
+
+
+def load_token(args):
+    if args.token:
+        return args.token
+    if os.environ.get("SASHIKO_API_TOKEN"):
+        return os.environ["SASHIKO_API_TOKEN"]
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        sys.exit("no token, see 'sashiko-bugs --help' for how to get one")
+
+
+def jwt_claims(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError):
+        return {}
+
+
+def request(args, method, path, query=None, body=None):
+    url = args.server.rstrip("/") + path
+    if query:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {load_token(args)}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode(errors="replace").strip()
+        hint = ""
+        if e.code == 404:
+            hint = " (no such bug, or the token can't read it)"
+        elif e.code == 403:
+            hint = " (token access level too low, or not your subsystem)"
+        elif e.code == 401:
+            hint = " (token expired or invalid, mint a new one)"
+        sys.exit(f"HTTP {e.code}{hint}: {msg}")
+    return json.loads(raw) if raw else {}
+
+
+def bug_param(bug_id):
+    bug_id = bug_id.strip()
+    return {"id": bug_id} if bug_id.isdigit() else {"bugid": bug_id}
+
+
+def fmt_time(ts):
+    if not ts:
+        return "-"
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def cmd_list(args):
+    items = []
+    page = 1
+    while True:
+        res = request(args, "GET", "/api/bugs", {
+            "page": page,
+            "per_page": 50,
+            "q": args.query,
+            "subsystem": args.subsystem,
+            "min_severity": args.min_severity,
+            "lifecycle_status": args.status,
+        })
+        batch = res.get("items", [])
+        items += batch
+        if not args.all_pages or not batch or len(items) >= res.get("total", 0):
+            break
+        page += 1
+
+    if args.file:
+        items = [b for b in items
+                 if any(args.file in (l.get("file") or "") for l in b.get("locations", []))]
+
+    if args.json:
+        json.dump(items, sys.stdout, indent=2)
+        print()
+        return
+
+    for b in sorted(items, key=lambda b: (b.get("lifecycle_status") or "", b["internal_id"])):
+        loc = (b.get("locations") or [{}])[0]
+        st = b.get("lifecycle_status") or "?"
+        if st == "duplicate" and b.get("duplicate_of_id"):
+            st = f"dup->{b['duplicate_of_id']}"
+        who = b.get("assignee") or ""
+        print(f"{b['internal_id']:>6}  {st:<12} {b.get('severity') or '?':<8} "
+              f"{loc.get('function_or_symbol') or '':<28} {b.get('title') or ''}"
+              + (f"  [{who}]" if who else ""))
+    print(f"-- {len(items)} bugs", file=sys.stderr)
+
+
+def cmd_show(args):
+    b = request(args, "GET", "/api/bug", bug_param(args.id))
+    if args.json:
+        json.dump(b, sys.stdout, indent=2)
+        print()
+        return
+
+    print(f"#{b.get('internal_id')}  {b.get('bugid')}")
+    print(f"title:      {b.get('title')}")
+    print(f"status:     {b.get('lifecycle_status')}  severity: {b.get('severity')}"
+          f"  assignee: {b.get('assignee') or '-'}")
+    if b.get("duplicate_of_id"):
+        print(f"dup of:     {b['duplicate_of_id']}")
+    print(f"created:    {fmt_time(b.get('created_at'))}"
+          f"  found in: {b.get('discovered_in_commit') or '-'}")
+    if b.get("fixed_in_commit"):
+        print(f"fixed in:   {b['fixed_in_commit']}")
+    print(f"verified:   {b.get('verified_on_sha') or '-'}")
+    print(f"subsystems: {', '.join(b.get('subsystems') or [])}")
+    print(f"you can:    {'manage' if b.get('can_manage') else 'comment' if b.get('can_comment') else 'read'}")
+    print(f"url:        {args.server.rstrip('/')}/#/bug/{urllib.parse.quote(b.get('bugid') or '')}")
+    for d in b.get("duplicates") or []:
+        print(f"duplicate:  {d.get('id')} {d.get('problem')}")
+    for key in ("description", "inline_review", "severity_explanation"):
+        if b.get(key):
+            print(f"\n== {key}\n{b[key]}")
+    for l in b.get("locations") or []:
+        print(f"\n== {l.get('file')}:{l.get('line')} {l.get('function_or_symbol') or ''}")
+        if l.get("why_this_location_matters"):
+            print(l["why_this_location_matters"])
+        if l.get("code_snippet"):
+            print("\n" + "\n".join("    " + s for s in l["code_snippet"].splitlines()))
+
+
+def cmd_action(args, body):
+    body["tool"] = "sashiko-bugs"
+    request(args, "POST", "/api/bug/action", bug_param(args.id), body)
+    print(f"{args.id}: {body['action']} ok")
+
+
+def cmd_comment(args):
+    cmd_action(args, {"action": "comment", "content": args.text})
+
+
+def cmd_close(args):
+    cmd_action(args, {"action": "close", "reason": args.reason})
+
+
+def cmd_dismiss(args):
+    cmd_action(args, {"action": "dismiss", "reason": args.reason})
+
+
+def cmd_dup(args):
+    body = {"action": "mark_duplicate", "reasoning": args.reason}
+    if args.of.isdigit():
+        body["duplicate_of_id"] = int(args.of)
+    else:
+        body["duplicate_of_bugid"] = args.of
+    cmd_action(args, body)
+
+
+def cmd_assign(args):
+    cmd_action(args, {"action": "assign", "assignee": args.email or None, "reason": args.reason})
+
+
+def cmd_token_save(args):
+    tok = (args.value or sys.stdin.readline()).strip()
+    if not jwt_claims(tok):
+        sys.exit("that does not look like a JWT")
+    os.makedirs(os.path.dirname(TOKEN_FILE), mode=0o700, exist_ok=True)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok + "\n")
+    print(f"saved to {TOKEN_FILE}")
+    args.token = tok
+    cmd_token_info(args)
+
+
+def cmd_token_info(args):
+    c = jwt_claims(load_token(args))
+    exp = c.get("exp")
+    left = ""
+    if exp:
+        days = (exp - datetime.datetime.now().timestamp()) / 86400
+        left = f" ({days:.1f} days left)" if days > 0 else " (EXPIRED)"
+    print(f"user:   {c.get('sub')}")
+    print(f"type:   {c.get('typ')}  access: {c.get('max_bug_access') or 'full (session)'}")
+    print(f"expiry: {fmt_time(exp)}{left}")
+    print(f"id:     {c.get('sid')}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sashiko-bugs", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--server", default=os.environ.get("SASHIKO_SERVER", DEFAULT_SERVER))
+    p.add_argument("--token")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("list", help="list bugs")
+    s.add_argument("query", nargs="?", help="free text search, e.g. genet")
+    s.add_argument("--subsystem")
+    s.add_argument("--status", help="lifecycle status, e.g. open, duplicate, dismissed")
+    s.add_argument("--min-severity", help="e.g. low, medium, high, critical")
+    s.add_argument("--file", help="only bugs with a location in a file matching this substring")
+    s.add_argument("--all-pages", action="store_true", help="fetch all pages instead of the first 50 bugs")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", help="show one bug (numeric id or bugid uuid)")
+    s.add_argument("id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("comment", help="add a comment")
+    s.add_argument("id")
+    s.add_argument("text")
+    s.set_defaults(func=cmd_comment)
+
+    for name, func, hlp in (("close", cmd_close, "close, e.g. when fixed"),
+                            ("dismiss", cmd_dismiss, "dismiss as false positive")):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("id")
+        s.add_argument("-r", "--reason")
+        s.set_defaults(func=func)
+
+    s = sub.add_parser("dup", help="mark as duplicate of another bug")
+    s.add_argument("id")
+    s.add_argument("of", help="id or bugid of the canonical bug")
+    s.add_argument("-r", "--reason")
+    s.set_defaults(func=cmd_dup)
+
+    s = sub.add_parser("assign", help="assign to an email, '' to unassign")
+    s.add_argument("id")
+    s.add_argument("email")
+    s.add_argument("-r", "--reason")
+    s.set_defaults(func=cmd_assign)
+
+    s = sub.add_parser("token-save", help=f"store a token in {TOKEN_FILE}")
+    s.add_argument("value", nargs="?", help="token, read from stdin if omitted")
+    s.set_defaults(func=cmd_token_save)
+
+    s = sub.add_parser("token-info", help="decode the current token locally")
+    s.set_defaults(func=cmd_token_info)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
